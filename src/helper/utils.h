@@ -57,6 +57,15 @@ enum rawrtc_code get_ice_role(
 );
 
 /*
+ * Create a data channel helper instance.
+ */
+void data_channel_helper_create(
+    struct data_channel_helper** const channel_helperp, // de-referenced
+    struct client* const client,
+    char* const label
+);
+
+/*
  * Create a data channel helper instance from parameters.
  */
 void data_channel_helper_create_from_channel(

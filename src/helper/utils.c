@@ -227,6 +227,31 @@ static void data_channel_helper_destroy(
 }
 
 /*
+ * Create a data channel helper instance.
+ */
+void data_channel_helper_create(
+        struct data_channel_helper** const channel_helperp, // de-referenced
+        struct client* const client,
+        char* const label
+) {
+    // Allocate
+    struct data_channel_helper* const channel =
+            mem_zalloc(sizeof(*channel), data_channel_helper_destroy);
+    if (!channel) {
+        EOE(RAWRTC_CODE_NO_MEMORY);
+        return;
+    }
+
+    // Set fields
+    channel->client = client;
+    EOE(rawrtc_strdup(&channel->label, label));
+
+    // Set pointer & done
+    *channel_helperp = channel;
+}
+
+
+/*
  * Create a data channel helper instance from parameters.
  */
 void data_channel_helper_create_from_channel(

@@ -8,4 +8,4 @@ set(rawrtc_HELPER
 # Setup helper library for linker
 add_library(rawrtc-helper STATIC ${rawrtc_HELPER})
 target_link_libraries(rawrtc-helper
-        ${rawrtc_terminal_DEP_LIBRARIES})
+        ${dc_pipe_DEP_LIBRARIES})

@@ -4,7 +4,8 @@
 #include <signal.h> // SIGTERM, kill
 #include <stdlib.h> // setenv
 #include <termios.h> // ioctl, struct winsize
-#include <pty.h> // forkpty
+#include <stropts.h> // ioctl I_NREAD
+
 #include <rawrtc.h>
 #include "helper/utils.h"
 #include "helper/handler.h"
@@ -42,7 +43,6 @@ struct terminal_client {
     char* name;
     char** ice_candidate_types;
     size_t n_ice_candidate_types;
-    char* shell;
     char* ws_uri;
     struct rawrtc_ice_gather_options* gather_options;
     enum rawrtc_ice_role role;
@@ -59,6 +59,7 @@ struct terminal_client {
     struct list data_channels;
     struct parameters local_parameters;
     struct parameters remote_parameters;
+    struct data_channel_helper* data_channel;
 };
 
 struct terminal_client_channel {
@@ -88,6 +89,12 @@ static struct odict* client_encode_parameters(
     struct terminal_client* const client
 );
 
+static void client_start_gathering(
+    struct terminal_client* const client
+);
+
+
+
 /*
  * Print the WS close event.
  */
@@ -97,6 +104,15 @@ static void ws_close_handler(
 ) {
     struct terminal_client* const client = arg;
     DEBUG_PRINTF("(%s) WS connection closed, reason: %m\n", client->name, err);
+
+    if( list_count(&client->data_channels) < 1) {
+    	DEBUG_PRINTF("(%s) Can't continue without signaling channel. Exiting...\n");
+
+    	// Stop client & bye
+		client_stop(client);
+		before_exit();
+		exit(0);
+    }
 }
 
 /*
@@ -119,6 +135,24 @@ static void ws_receive_handler(
         return;
     }
 
+    if (1 == mbuf_get_left(buffer)) { // receiving role
+    	DEBUG_NOTICE("Server assigned role: %c\n", mbuf_buf(buffer)[0]);
+    	switch (mbuf_buf(buffer)[0]) {
+    	case '0':
+    		client->role = RAWRTC_ICE_ROLE_CONTROLLING;
+    		break;
+    	case '1':
+    		client->role = RAWRTC_ICE_ROLE_CONTROLLED;
+    		break;
+    	}
+
+        // Start gathering
+        client_start_gathering(client);
+
+    	return;
+    }
+
+
     // Decode JSON
     error = rawrtc_error_to_code(json_decode_odict(
             &dict, 16, (char*) mbuf_buf(buffer), mbuf_get_left(buffer), 3));
@@ -136,6 +170,7 @@ static void ws_receive_handler(
         // Close WS connection
         EOR(websock_close(client->ws_connection, WEBSOCK_NORMAL_CLOSURE, NULL));
         client->ws_connection = mem_deref(client->ws_connection);
+        DEBUG_NOTICE("(%s) WebSocket closed after decoding parameters.\n", client->name);
     }
 
     // Un-reference
@@ -149,58 +184,82 @@ static void ws_established_handler(
         void* arg
 ) {
     struct terminal_client* const client = arg;
-    struct odict* dict;
     DEBUG_PRINTF("(%s) WS connection established\n", client->name);
 
-    // Encode parameters
-    dict = client_encode_parameters(client);
 
-    // Send as JSON
-    DEBUG_INFO("(%s) Sending local parameters\n", client->name);
-    EOR(websock_send(client->ws_connection, WEBSOCK_TEXT, "%H", json_encode_odict, dict));
-
-    // Un-reference
-    mem_deref(dict);
 }
 
 /*
- * Parse the JSON encoded remote parameters and apply them.
+ * Read STDIN and send it to all data channels.
  */
-static void stdin_receive_handler(
+static void stdin_read_handler(
         int flags,
         void* arg
 ) {
     struct terminal_client* const client = arg;
-    struct odict* dict = NULL;
     enum rawrtc_code error;
     (void) flags;
+    int length;
+    int i,n;
 
-    // Get dict from JSON
-    error = get_json_stdin(&dict);
-    if (error) {
-        goto out;
-    }
+    // Create buffer
+    struct mbuf* const buffer = mbuf_alloc(PIPE_READ_BUFFER);
 
-    // Decode parameters
-    if (client_decode_parameters(&client->remote_parameters, dict, client) == RAWRTC_CODE_SUCCESS) {
-        // Set parameters & start transports
-        client_apply_parameters(client);
-        client_start_transports(client);
-    }
+    struct data_channel_helper* cn_channel;
+    struct terminal_client* cn_client;
+    struct le *le;
 
-out:
-    // Un-reference
-    mem_deref(dict);
+    do {
+      // read a line
+      DEBUG_PRINTF("Start reading from stdin ...\n");
+      if(!fgets((char*)mbuf_buf(buffer), mbuf_get_space(buffer), stdin)) {
+        EWE("Error polling stdin");
+      }
+      length = strnlen(mbuf_buf(buffer), PIPE_READ_BUFFER);
+      mbuf_set_end(buffer, (size_t) length);
 
-    // Exit?
-    if (error == RAWRTC_CODE_NO_VALUE) {
-        DEBUG_NOTICE("Exiting\n");
+      mbuf_buf(buffer)[length]='\r';
+      mbuf_buf(buffer)[length+1]='\0';
+      mbuf_set_end(buffer, (size_t) length+1);
 
-        // Stop client & bye
-        client_stop(client);
-        before_exit();
-        exit(0);
-    }
+      DEBUG_PRINTF("... DONE reading from stdin: %zu bytes\n", length);
+
+      if(feof(stdin)) {
+        DEBUG_NOTICE("stdin EOF reached\n");
+        break;
+      } else if(ferror(stdin)){
+        DEBUG_NOTICE("error reading stdin\n");
+        break;
+      } else {
+        DEBUG_NOTICE("stdin read: %s\n", mbuf_buf(buffer));
+
+        // TODO send through all connected to data channels
+        LIST_FOREACH(&client->data_channels, le) {
+        	cn_channel = list_ledata(le);
+            cn_client = (struct terminal_client* const) cn_channel->client;
+
+            DEBUG_PRINTF("(%s.%s) Sending %zu bytes\n", cn_client->name, cn_channel->label, length);
+            EOE(rawrtc_data_channel_send(cn_channel->channel, buffer, false));
+        }
+
+        if(ioctl(STDIN_FILENO, I_NREAD, &n) == 0 && n > 0) {
+          DEBUG_PRINTF("stdin_read_handler: keep reading:[%zu]...\n",n);
+          continue;
+        } else {
+          mem_deref(buffer);
+          DEBUG_PRINTF("stdin_read_handle: returning...\n");
+          return;
+        }
+      }
+    }while (1);
+
+    mem_deref(buffer);
+    DEBUG_NOTICE("Exiting as EOF on stdin was reached\n");
+
+    // Stop client & bye
+    client_stop(client);
+    before_exit();
+    exit(0);
 }
 
 /*
@@ -221,6 +280,22 @@ static void print_local_parameters(
     mem_deref(dict);
 }
 
+static void send_local_parameters(
+		struct terminal_client* const client
+){
+	struct odict* dict;
+
+	// Encode parameters
+	dict = client_encode_parameters(client);
+
+	// Send as JSON
+	DEBUG_INFO("(%s) Sending local parameters\n", client->name);
+	EOR(websock_send(client->ws_connection, WEBSOCK_TEXT, "%H", json_encode_odict, dict));
+
+	// Un-reference
+	mem_deref(dict);
+}
+
 /*
  * Print the local candidate. Open a connection to the WS server in
  * case all candidates have been gathered.
@@ -237,15 +312,8 @@ static void ice_gatherer_local_candidate_handler(
 
     // Print or send local parameters (if last candidate)
     if (!candidate) {
-        if (client->ws_socket) {
-            EOR(websock_connect(
-                &client->ws_connection, client->ws_socket, client->http_client,
-                client->ws_uri, 30000,
-                ws_established_handler, ws_receive_handler, ws_close_handler,
-                client, NULL));
-        } else {
-            print_local_parameters(client);
-        }
+    	DEBUG_NOTICE("Last candidate received ...\n");
+    	send_local_parameters(client);
     }
 }
 
@@ -264,70 +332,17 @@ void data_channel_message_handler(
             (struct terminal_client* const) channel->client;
     size_t const length = mbuf_get_left(buffer);
     (void) flags;
-    DEBUG_PRINTF("(%s.%s) Received %zu bytes\n", client->name, channel->label, length);
+    DEBUG_PRINTF("(%s.%s) Received %zu bytes\n",
+                 client->name, channel->label, length);
 
     if (flags & RAWRTC_DATA_CHANNEL_MESSAGE_FLAG_IS_BINARY) {
-        uint_fast8_t type;
-
-        // Check size
-        if (length < 1) {
-            DEBUG_WARNING("(%s.%s) Invalid control message of size %zu\n",
-                    client->name, channel->label, length);
-            return;
-        }
-
-        // Get type
-        type = mbuf_read_u8(buffer);
-
-        // Handle control message
-        switch (type) {
-            case CONTROL_MESSAGE_WINDOW_SIZE_TYPE:
-                // Check size
-                if (length < CONTROL_MESSAGE_WINDOW_SIZE_LENGTH) {
-                    DEBUG_WARNING("(%s.%s) Invalid window size message of size %zu\n",
-                            client->name, channel->label, length);
-                    return;
-                }
-                {
-                    uint_fast16_t columns;
-                    uint_fast16_t rows;
-                    struct winsize window_size = {0};
-
-                    // Get window size
-                    columns = ntohs(mbuf_read_u16(buffer));
-                    rows = ntohs(mbuf_read_u16(buffer));
-
-                    // Check window size
-#if (UINT16_MAX > USHRT_MAX)
-                    if (columns > USHRT_MAX || rows > USHRT_MAX) {
-                        DEBUG_WARNING("(%s.%s) Invalid window size value\n",
-                                      client->name, channel->label);
-                        return;
-                    }
-#endif
-
-                    // Set window size
-                    window_size.ws_col = (unsigned short) columns;
-                    window_size.ws_row = (unsigned short) rows;
-
-                    // Apply window size
-                    DEBUG_PRINTF("(%s.%s) Resizing terminal to %"PRIuFAST16" columns and "
-                            "%"PRIuFAST16" rows\n", client->name, channel->label, columns, rows);
-                    EOP(ioctl(client_channel->pty, TIOCSWINSZ, &window_size));
-                }
-
-                break;
-            default:
-                DEBUG_WARNING("(%s.%s) Unknown control message %"PRIuFAST8"\n",
-                              client->name, channel->label, length);
-                break;
-        }
+        DEBUG_PRINTF("(%s.%s) binary datachannel message - ignoring\n",
+                     client->name, channel->label);
     } else {
-        // Write into PTY
-        // TODO: Handle EAGAIN?
-        DEBUG_PRINTF("(%s.%s) Piping %zu bytes into process...\n",
+        // TODO: write to STDOUT
+
+        DEBUG_PRINTF("(%s.%s) Ignoring %zu bytes received from data channel...\n",
                      client->name, channel->label, length);
-        EOP(write(client_channel->pty, mbuf_buf(buffer), length));
         DEBUG_PRINTF("(%s.%s) ... completed!\n", client->name, channel->label);
     }
 }
@@ -338,24 +353,7 @@ void data_channel_message_handler(
 static void stop_process(
         struct terminal_client_channel* const channel
 ) {
-    // Close PTY (if not already closed)
-    if (channel->pty != -1) {
-        // Stop listening on PTY
-        fd_close(channel->pty);
-        EOP(close(channel->pty));
-
-        // Invalidate PTY
-        channel->pty = -1;
-    }
-
-    // Stop process (if not already stopped)
-    if (channel->pid != -1) {
-        // Terminate process
-        EOP(kill(channel->pid, SIGTERM));
-
-        // Invalidate process
-        channel->pid = -1;
-    }
+    DEBUG_INFO("Closing client channel\n");
 }
 
 /*
@@ -366,6 +364,8 @@ static void data_channel_error_handler(
 ) {
     struct data_channel_helper* const channel = arg;
     struct terminal_client_channel* const client_channel = channel->arg;
+
+    DEBUG_INFO("(%s.%s) data_channel error", channel->client->name, channel->label);
 
     // Print error event
     default_data_channel_error_handler(arg);
@@ -385,6 +385,8 @@ void data_channel_close_handler(
 ) {
     struct data_channel_helper* const channel = arg;
     struct terminal_client_channel* const client_channel = channel->arg;
+
+    DEBUG_INFO("(%s.%s) data_channel closed", channel->client->name, channel->label);
 
     // Print close event
     default_data_channel_close_handler(arg);
@@ -465,38 +467,17 @@ static void data_channel_open_handler(
     struct terminal_client_channel* const client_channel = channel->arg;
     struct terminal_client* const client =
             (struct terminal_client* const) channel->client;
-    pid_t pid;
     int pty;
+    struct data_channel_helper* removed;
+
+    DEBUG_PRINTF("(%s.%s) DataChannel opened\n", client->name, channel->label);
 
     // Print open event
     default_data_channel_open_handler(arg);
 
-    // Fork to pseudo-terminal
-    // TODO: Check bounds (PID_MAX < INT_MAX...)
-    // TODO: Fix leaking FDs
-    DEBUG_INFO("(%s) Starting process for data channel %s\n",
-               channel->client->name, channel->label);
-    pid = (pid_t) forkpty(&pty, NULL, NULL, NULL);
-    EOP(pid);
-
-    // Child process
-    if (pid == 0) {
-        char* const args[] = {client->shell, NULL};
-
-        // Make it colourful!
-        EOP(setenv("TERM", "xterm-256color", 1));
-
-        // Run terminal
-        EOP(execvp(args[0], args));
-        EWE("Child process returned!\n");
-    }
-
-    // Set fields
-    client_channel->pid = pid;
-    client_channel->pty = pty;
 
     // Listen on PTY
-    EOR(fd_listen(client_channel->pty, FD_READ, pty_read_handler, channel));
+    //EOR(fd_listen(client_channel->pty, FD_READ, pty_read_handler, channel));
 }
 
 static void terminal_client_channel_destroy(
@@ -518,6 +499,8 @@ static void data_channel_handler(
     struct terminal_client* const client = arg;
     struct terminal_client_channel* client_channel;
     struct data_channel_helper* channel_helper;
+
+    DEBUG_PRINTF("(%s) in data_channel_handler\n", client->name);
 
     // Print channel
     default_data_channel_handler(channel, arg);
@@ -550,6 +533,57 @@ static void data_channel_handler(
     EOE(rawrtc_data_channel_set_close_handler(channel, data_channel_close_handler));
     EOE(rawrtc_data_channel_set_message_handler(channel, data_channel_message_handler));
 }
+
+void client_create_data_channel(
+		struct terminal_client* const client
+) {
+	struct rawrtc_data_channel_parameters* channel_parameters;
+
+	// Create data channel helper
+	data_channel_helper_create(
+			&client->data_channel, (struct client *) client, "data-channel-pipe");
+
+	// Create data channel parameters
+	EOE(rawrtc_data_channel_parameters_create(
+			&channel_parameters, client->data_channel->label,
+			RAWRTC_DATA_CHANNEL_TYPE_RELIABLE_UNORDERED, 0, NULL, false, 0));
+
+	// Create data channel
+	EOE(rawrtc_data_channel_create(
+			&client->data_channel->channel, client->data_transport,
+			channel_parameters, NULL,
+			data_channel_open_handler,
+			default_data_channel_buffered_amount_low_handler,
+			data_channel_error_handler, data_channel_close_handler,
+			data_channel_message_handler, client->data_channel));
+
+	// Add to list
+    list_append(&client->data_channels, &client->data_channel->le, client->data_channel);
+
+	// Un-reference
+	mem_deref(channel_parameters);
+}
+
+void some_sctp_transport_state_change_handler(
+        enum rawrtc_sctp_transport_state const state,
+        void* const arg // will be casted to `struct client*`
+) {
+    // struct client* const client = arg;
+    struct terminal_client* const client = arg;
+
+    char const * const state_name = rawrtc_sctp_transport_state_to_name(state);
+
+    default_sctp_transport_state_change_handler(state, arg);
+
+    if (RAWRTC_SCTP_TRANSPORT_STATE_CONNECTED == state){
+    	DEBUG_INFO("SCTP connected - DTLS role:%d ... \n",client->dtls_transport->role);
+    	if(client->dtls_transport->role == 1) {
+        	DEBUG_INFO("creating the DataChannel ...\n");
+        	client_create_data_channel(client);
+    	}
+    }
+}
+
 
 static void client_init(
         struct terminal_client* const client
@@ -593,11 +627,12 @@ static void client_init(
     EOE(rawrtc_sctp_transport_create(
             &client->sctp_transport, client->dtls_transport,
             client->local_parameters.sctp_parameters.port,
-            data_channel_handler, default_sctp_transport_state_change_handler, client));
+            data_channel_handler, some_sctp_transport_state_change_handler, client));
 
     // Get data transport
     EOE(rawrtc_sctp_transport_get_data_transport(
             &client->data_transport, client->sctp_transport));
+
 }
 
 static void client_start_gathering(
@@ -678,7 +713,6 @@ static void client_stop(
     client->dns_client = mem_deref(client->dns_client);
     client->gather_options = mem_deref(client->gather_options);
     client->ws_uri = mem_deref(client->ws_uri);
-    client->shell = mem_deref(client->shell);
 }
 
 static void client_apply_parameters(
@@ -792,8 +826,8 @@ static struct odict* client_encode_parameters(
 }
 
 static void exit_with_usage(char* program) {
-    DEBUG_WARNING("Usage: %s <0|1 (ice-role)> [<ws-uri>] [<shell>] [<sctp-port>] "
-                  "[<ice-candidate-type> ...]", program);
+    DEBUG_WARNING("Usage: %s <ws-uri> <0|1 (ice-role)> [<sctp-port>] "
+                  "[<ice-candidate-type> ...]\n", program);
     exit(1);
 }
 
@@ -816,45 +850,43 @@ int main(int argc, char* argv[argc + 1]) {
     DEBUG_PRINTF("Init\n");
 
     // Check arguments length
-    if (argc < 2) {
-        exit_with_usage(argv[0]);
-    }
-
-    // Get ICE role
-    if (get_ice_role(&role, argv[1])) {
+    if (argc < 3) {
         exit_with_usage(argv[0]);
     }
 
     // Get WS URI (optional)
-    if (argc >= 3 && re_regex(argv[2], strlen(argv[2]), ws_uri_regex, NULL) == 0) {
-        EOE(rawrtc_sdprintf(&client.ws_uri, argv[2]));
-        DEBUG_PRINTF("Using mode: WebSocket\n");
+    if (re_regex(argv[1], strlen(argv[1]), ws_uri_regex, NULL) == 0) {
+        EOE(rawrtc_sdprintf(&client.ws_uri, argv[1]));
+        DEBUG_PRINTF("Using signaling URI: %s\n", client.ws_uri);
     } else {
-        DEBUG_PRINTF("Using mode: Copy & Paste\n");
+    	DEBUG_PRINTF("Illegal signaling URI: %s\n", argv[1]);
+    	exit_with_usage(argv[0]);
     }
 
-    // Get shell (optional)
-    if (argc >= 4) {
-        EOE(rawrtc_sdprintf(&client.shell, argv[3]));
-    } else {
-        EOE(rawrtc_sdprintf(&client.shell, "bash"));
+    // Get ICE role
+    if (argc >= 3 && get_ice_role(&role, argv[2])) {
+    	DEBUG_PRINTF("Illegal ice role: %s\n", argv[2]);
+        exit_with_usage(argv[0]);
     }
-    DEBUG_PRINTF("Using process: %s\n", client.shell);
+    DEBUG_PRINTF("Using ice role: %d\n", role);
 
     // Get SCTP port (optional)
-    if (argc >= 5 && !str_to_uint16(&client.local_parameters.sctp_parameters.port, argv[4])) {
+    if (argc >= 4 && !str_to_uint16(&client.local_parameters.sctp_parameters.port, argv[3])) {
+    	DEBUG_PRINTF("Illegal SCTP port: %s\n", argv[3]);
         exit_with_usage(argv[0]);
     }
 
     // Get enabled ICE candidate types to be added (optional)
-    if (argc >= 6) {
-        ice_candidate_types = &argv[5];
-        n_ice_candidate_types = (size_t) argc - 5;
+    if (argc >= 4) {
+    	DEBUG_PRINTF("Using ICE types: %s\n", argv[4]);
+        ice_candidate_types = &argv[4];
+        n_ice_candidate_types = (size_t) argc - 4;
     }
 
     // Create ICE gather options
     EOE(rawrtc_ice_gather_options_create(&gather_options, RAWRTC_ICE_GATHER_POLICY_ALL));
 
+    /*
     // Add ICE servers to ICE gather options
     EOE(rawrtc_ice_gather_options_add_server(
             gather_options, stun_google_com_urls, ARRAY_SIZE(stun_google_com_urls),
@@ -863,6 +895,7 @@ int main(int argc, char* argv[argc + 1]) {
             gather_options, turn_threema_ch_urls, ARRAY_SIZE(turn_threema_ch_urls),
             "threema-angular", "Uv0LcCq3kyx6EiRwQW5jVigkhzbp70CjN2CJqzmRxG3UGIdJHSJV6tpo7Gj7YnGB",
             RAWRTC_ICE_CREDENTIAL_TYPE_PASSWORD));
+    */
 
     // Set client fields
     client.name = "A";
@@ -875,11 +908,15 @@ int main(int argc, char* argv[argc + 1]) {
     // Setup client
     client_init(&client);
 
-    // Start gathering
-    client_start_gathering(&client);
+	DEBUG_NOTICE("Connecting signaling WebSocket ...\n");
+	EOR(websock_connect(
+		&client.ws_connection, client.ws_socket, client.http_client,
+		client.ws_uri, 30000,
+		ws_established_handler, ws_receive_handler, ws_close_handler,
+		&client, NULL));
 
     // Listen on stdin
-    EOR(fd_listen(STDIN_FILENO, FD_READ, stdin_receive_handler, &client));
+    EOR(fd_listen(STDIN_FILENO, FD_READ, stdin_read_handler, &client));
 
     // Start main loop
     // TODO: Wrap re_main?

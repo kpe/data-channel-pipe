@@ -1,0 +1,7 @@
+.cproject
+.project
+.pydevproject
+.settings/
+.venv/
+build/
+node_modules/
