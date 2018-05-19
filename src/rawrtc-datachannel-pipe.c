@@ -167,10 +167,6 @@ static void ws_receive_handler(
         client_apply_parameters(client);
         client_start_transports(client);
 
-        // Close WS connection
-        EOR(websock_close(client->ws_connection, WEBSOCK_NORMAL_CLOSURE, NULL));
-        client->ws_connection = mem_deref(client->ws_connection);
-        DEBUG_NOTICE("(%s) WebSocket closed after decoding parameters.\n", client->name);
     }
 
     // Un-reference
@@ -291,6 +287,7 @@ static void send_local_parameters(
 	// Send as JSON
 	DEBUG_INFO("(%s) Sending local parameters\n", client->name);
 	EOR(websock_send(client->ws_connection, WEBSOCK_TEXT, "%H", json_encode_odict, dict));
+
 
 	// Un-reference
 	mem_deref(dict);
@@ -576,6 +573,12 @@ void some_sctp_transport_state_change_handler(
     default_sctp_transport_state_change_handler(state, arg);
 
     if (RAWRTC_SCTP_TRANSPORT_STATE_CONNECTED == state){
+        // Close WS connection
+        EOR(websock_close(client->ws_connection, WEBSOCK_NORMAL_CLOSURE, NULL));
+        client->ws_connection = mem_deref(client->ws_connection);
+        DEBUG_NOTICE("(%s) WebSocket closed after SCTP connected.\n", client->name);
+
+
     	DEBUG_INFO("SCTP connected - DTLS role:%d ... \n",client->dtls_transport->role);
     	if(client->dtls_transport->role == 1) {
         	DEBUG_INFO("creating the DataChannel ...\n");
@@ -826,7 +829,7 @@ static struct odict* client_encode_parameters(
 }
 
 static void exit_with_usage(char* program) {
-    DEBUG_WARNING("Usage: %s <ws-uri> <0|1 (ice-role)> [<sctp-port>] "
+    DEBUG_WARNING("Usage: %s <ws-uri> [<sctp-port>] "
                   "[<ice-candidate-type> ...]\n", program);
     exit(1);
 }
@@ -834,7 +837,6 @@ static void exit_with_usage(char* program) {
 int main(int argc, char* argv[argc + 1]) {
     char** ice_candidate_types = NULL;
     size_t n_ice_candidate_types = 0;
-    enum rawrtc_ice_role role;
     struct rawrtc_ice_gather_options* gather_options;
     char* const stun_google_com_urls[] = {"stun:stun.l.google.com:19302",
                                           "stun:stun1.l.google.com:19302"};
@@ -850,7 +852,7 @@ int main(int argc, char* argv[argc + 1]) {
     DEBUG_PRINTF("Init\n");
 
     // Check arguments length
-    if (argc < 3) {
+    if (argc < 2) {
         exit_with_usage(argv[0]);
     }
 
@@ -863,46 +865,43 @@ int main(int argc, char* argv[argc + 1]) {
     	exit_with_usage(argv[0]);
     }
 
-    // Get ICE role
-    if (argc >= 3 && get_ice_role(&role, argv[2])) {
-    	DEBUG_PRINTF("Illegal ice role: %s\n", argv[2]);
-        exit_with_usage(argv[0]);
-    }
-    DEBUG_PRINTF("Using ice role: %d\n", role);
-
     // Get SCTP port (optional)
-    if (argc >= 4 && !str_to_uint16(&client.local_parameters.sctp_parameters.port, argv[3])) {
-    	DEBUG_PRINTF("Illegal SCTP port: %s\n", argv[3]);
-        exit_with_usage(argv[0]);
+    if (argc >= 3) {
+    	if(!str_to_uint16(&client.local_parameters.sctp_parameters.port, argv[2])) {
+    		DEBUG_PRINTF("Illegal SCTP port: %s\n", argv[2]);
+    		exit_with_usage(argv[0]);
+    	} else {
+    		DEBUG_PRINTF("Using SCTP port: %s\n", argv[2]);
+    	}
     }
 
     // Get enabled ICE candidate types to be added (optional)
-    if (argc >= 4) {
-    	DEBUG_PRINTF("Using ICE types: %s\n", argv[4]);
-        ice_candidate_types = &argv[4];
-        n_ice_candidate_types = (size_t) argc - 4;
+    if (argc >= 3) {
+    	DEBUG_PRINTF("Using ICE types: %s\n", argv[3]);
+        ice_candidate_types = &argv[3];
+        n_ice_candidate_types = (size_t) argc - 3;
     }
 
     // Create ICE gather options
     EOE(rawrtc_ice_gather_options_create(&gather_options, RAWRTC_ICE_GATHER_POLICY_ALL));
 
-    /*
+/**/
     // Add ICE servers to ICE gather options
     EOE(rawrtc_ice_gather_options_add_server(
             gather_options, stun_google_com_urls, ARRAY_SIZE(stun_google_com_urls),
             NULL, NULL, RAWRTC_ICE_CREDENTIAL_TYPE_NONE));
+
     EOE(rawrtc_ice_gather_options_add_server(
             gather_options, turn_threema_ch_urls, ARRAY_SIZE(turn_threema_ch_urls),
             "threema-angular", "Uv0LcCq3kyx6EiRwQW5jVigkhzbp70CjN2CJqzmRxG3UGIdJHSJV6tpo7Gj7YnGB",
             RAWRTC_ICE_CREDENTIAL_TYPE_PASSWORD));
-    */
+/**/
 
     // Set client fields
     client.name = "A";
     client.ice_candidate_types = ice_candidate_types;
     client.n_ice_candidate_types = n_ice_candidate_types;
     client.gather_options = gather_options;
-    client.role = role;
     list_init(&client.data_channels);
 
     // Setup client
