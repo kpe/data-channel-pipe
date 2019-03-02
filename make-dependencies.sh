@@ -45,6 +45,10 @@ if [ "$have_rawrtc" = false ]; then
     echo "\n\n============================"
     echo "Building RawRTC Dependencies"
     cd ${DEPS_DIR}/rawrtc
+
+    echo "Patching WERROR=OFF for usrsctp"
+    sed -i 's/-DSCTP_DEBUG=1 ../-DSCTP_DEBUG=1 -DWERROR=OFF .. /g' ${DEPS_DIR}/rawrtc/make-dependencies.sh
+
     ${DEPS_DIR}/rawrtc/make-dependencies.sh
     echo "\n\n==============="
     echo "Building RawRTC"
